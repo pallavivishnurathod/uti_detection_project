@@ -1,0 +1,414 @@
+```python
+!pip install -q gradio xgboost joblib llama-cpp-python
+
+import os, json, warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+
+import joblib
+import gradio as gr
+from google.colab import drive
+
+from llama_cpp import Llama
+
+drive.mount("/content/drive")
+
+CSV_PATH      = "/content/drive/MyDrive/uti.csv"              # your dataset
+MODEL_SAVE    = "/content/drive/MyDrive/UTIDetectionSystem"
+MLP_PATH      = os.path.join(MODEL_SAVE, "uti_mlp_model.h5")
+SCALER_PATH   = os.path.join(MODEL_SAVE, "scaler.pkl")
+COLS_PATH     = os.path.join(MODEL_SAVE, "train_columns.json")
+
+os.makedirs(MODEL_SAVE, exist_ok=True)
+
+df = pd.read_csv(CSV_PATH)
+print("Loaded dataset shape:", df.shape)
+
+drop_cols = [
+    "ID", "PATID", "lang", "race", "ethnicity", "maritalStatus", "employStatus",
+    "insurance_status", "disposition", "arrival", "dispo", "split", "abxUTI",
+    "alt_diag", "O2_Amount_Last", "O2_Amount_First", "O2_Amount_Max",
+    "O2_Amount_Min", "O2_Dependency_First",
+    "O2_Dependency_Last", "alert"
+]
+df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True, errors="ignore")
+
+# Drop columns with >75% 'not_reported' or null
+columns_to_drop_not_reported = []
+threshold = 0.75 * len(df)
+
+for col in df.columns:
+    not_reported_count = df[col].astype(str).str.strip().str.lower().eq("not_reported").sum()
+    null_count = df[col].isnull().sum()
+    if (not_reported_count + null_count) > threshold:
+        columns_to_drop_not_reported.append(col)
+
+if columns_to_drop_not_reported:
+    df.drop(columns=columns_to_drop_not_reported, inplace=True, errors="ignore")
+    print("Dropped sparse columns:", len(columns_to_drop_not_reported))
+
+# Target mapping
+df["UTI_diag"] = df["UTI_diag"].astype(str).str.strip().str.lower().map({"yes": 1, "no": 0})
+df = df[df["UTI_diag"].notnull()]
+print("After dropping rows without target:", df.shape)
+
+# Separate features/target (keep raw df copy for manual row building)
+target = df["UTI_diag"]
+df_features = df.drop(columns=["UTI_diag"])
+
+# Identify categorical & numeric
+num_cols = df_features.select_dtypes(include=[np.number]).columns.tolist()
+cat_cols = df_features.select_dtypes(include=["object", "category"]).columns.tolist()
+print(f"Numeric cols: {len(num_cols)}, Categorical cols: {len(cat_cols)}")
+
+# Impute
+cat_imputer = SimpleImputer(strategy="most_frequent")
+num_imputer = SimpleImputer(strategy="median")
+
+if cat_cols:
+    df_features[cat_cols] = cat_imputer.fit_transform(df_features[cat_cols])
+if num_cols:
+    df_features[num_cols] = num_imputer.fit_transform(df_features[num_cols])
+
+# One-hot encode categoricals
+df_encoded = pd.get_dummies(df_features, columns=cat_cols, drop_first=True, dtype=np.int64)
+
+# Add target
+df_processed = df_encoded.copy()
+df_processed["UTI_diag"] = target.values
+
+# Ensure numeric and fill NA
+df_processed = df_processed.apply(pd.to_numeric, errors="coerce").fillna(0).astype(np.float32)
+
+print("Processed data shape:", df_processed.shape)
+
+X = df_processed.drop(columns=["UTI_diag"])
+y = df_processed["UTI_diag"]
+
+scaler = StandardScaler()
+numeric_cols_after = X.select_dtypes(include=[np.number]).columns.tolist()
+X[numeric_cols_after] = scaler.fit_transform(X[numeric_cols_after])
+
+joblib.dump(scaler, SCALER_PATH)
+print("Saved scaler to:", SCALER_PATH)
+
+train_columns = X.columns.tolist()
+with open(COLS_PATH, "w") as f:
+    json.dump(train_columns, f)
+print("Saved train columns to:", COLS_PATH)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+print("Train/Test shapes:", X_train.shape, X_test.shape)
+
+input_dim = X_train.shape[1]
+mlp_model = Sequential([
+    Dense(256, activation="relu", input_dim=input_dim),
+    BatchNormalization(),
+    Dropout(0.3),
+    Dense(128, activation="relu"),
+    BatchNormalization(),
+    Dropout(0.3),
+    Dense(64, activation="relu"),
+    Dropout(0.2),
+    Dense(1, activation="sigmoid")
+])
+
+mlp_model.compile(
+    optimizer=Adam(learning_rate=0.001),
+    loss="binary_crossentropy",
+    metrics=["accuracy"]
+)
+
+early_stop = EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
+
+history = mlp_model.fit(
+    X_train, y_train,
+    validation_data=(X_test, y_test),
+    epochs=50,
+    batch_size=64,
+    callbacks=[early_stop],
+    verbose=1
+)
+
+y_pred_prob = mlp_model.predict(X_test).ravel()
+y_pred = (y_pred_prob > 0.5).astype(int)
+
+print("\nClassification Report:\n", classification_report(y_test, y_pred))
+print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
+try:
+    print("\nROC-AUC:", roc_auc_score(y_test, y_pred_prob))
+except Exception:
+    pass
+
+mlp_model.save(MLP_PATH)
+print("Saved MLP model to:", MLP_PATH)
+
+# Reload (optional, for clarity)
+with open(COLS_PATH, "r") as f:
+    train_columns = json.load(f)
+scaler = joblib.load(SCALER_PATH)
+
+MANUAL_FEATURES = [
+    "ua_leuk","ua_nitrite","ua_bacteria","ua_rbc","ua_blood",
+    "ua_ph","ua_spec_grav","ua_protein","ua_glucose","ua_ketones",
+    "ua_bili","ua_color","ua_clarity","ua_epi"
+]
+
+manual_options = {
+    "ua_leuk":    ["negative","small","moderate","large","other"],
+    "ua_nitrite": ["negative","positive","other"],
+    "ua_bacteria":["none","few","moderate","many","not_reported"],
+    "ua_rbc":     ["negative","small","moderate","large","not_reported"],
+    "ua_blood":   ["negative","small","moderate","large","other"],
+    "ua_ph":      [5.0,5.5,6.0,6.5,7.0,7.5,8.0],
+    "ua_spec_grav":["1.015","1.016","1.017","1.018","1.019","1.020","1.021","1.022"],
+    "ua_protein": ["negative","small","moderate","large","other"],
+    "ua_glucose": ["negative","small","moderate","large","other"],
+    "ua_ketones": ["negative","small","moderate","large","other"],
+    "ua_bili":    ["negative","small","moderate","large","not_reported"],
+    "ua_color":   ["yellow","amber","red","colorless","orange"],
+    "ua_clarity": ["clear","not_clear","not_reported"],
+    "ua_epi":     ["negative","small","moderate","large","not_reported"]
+}
+
+# Default modes from df (raw, pre-encoding)
+modes = {}
+for f in MANUAL_FEATURES:
+    if f in df.columns:
+        modes[f] = df[f].mode().iloc[0]
+    else:
+        modes[f] = manual_options.get(f, [None])[0]
+
+def build_full_input(manual_dict):
+    """
+    Build a single encoded & scaled row for the MLP using:
+    - raw df column structure
+    - same encoding & scaling as training
+    """
+    base = {}
+    for col in df.columns:
+        if col == "UTI_diag":
+            continue
+        try:
+            base[col] = df[col].mode().iloc[0]
+        except Exception:
+            base[col] = "not_reported"
+
+    for k, v in manual_dict.items():
+        base[k] = v
+
+    row = pd.DataFrame([base], columns=[c for c in df.columns if c != "UTI_diag"])
+
+    # Fill missing like training
+    for c in row.select_dtypes(include=["object","category"]).columns:
+        if c in df.columns:
+            row[c] = row[c].fillna(df[c].mode().iloc[0])
+        else:
+            row[c] = row[c].fillna("not_reported")
+
+    for c in row.select_dtypes(include=[np.number]).columns:
+        if c in df.columns:
+            # Ensure column is numeric before calculating median
+            row[c] = row[c].fillna(pd.to_numeric(df[c], errors='coerce').median())
+        else:
+            row[c] = row[c].fillna(0)
+
+    # One-hot like training
+    cat_like = row.select_dtypes(include=["object","category"]).columns.tolist()
+    row_encoded = pd.get_dummies(row, columns=cat_like, drop_first=True, dtype=np.int64)
+
+    for col in train_columns:
+        if col not in row_encoded.columns:
+            row_encoded[col] = 0
+
+    row_encoded = row_encoded[train_columns]
+    row_encoded[numeric_cols_after] = scaler.transform(row_encoded[numeric_cols_after])
+    return row_encoded
+
+def run_prediction_manual(
+    ua_leuk, ua_nitrite, ua_bacteria, ua_rbc, ua_blood,
+    ua_ph, ua_spec_grav,
+    ua_protein, ua_glucose, ua_ketones, ua_bili, ua_color, ua_clarity, ua_epi
+):
+    manual_dict = {
+        "ua_leuk": ua_leuk,
+        "ua_nitrite": ua_nitrite,
+        "ua_bacteria": ua_bacteria,
+        "ua_rbc": ua_rbc,
+        "ua_blood": ua_blood,
+        "ua_ph": float(ua_ph),
+        "ua_spec_grav": str(ua_spec_grav),
+        "ua_protein": ua_protein,
+        "ua_glucose": ua_glucose,
+        "ua_ketones": ua_ketones,
+        "ua_bili": ua_bili,
+        "ua_color": ua_color,
+        "ua_clarity": ua_clarity,
+        "ua_epi": ua_epi
+    }
+
+    X_row = build_full_input(manual_dict)
+    print("\n--- Generated Input X_row Head ---")
+    print(X_row.head())
+    prob = float(mlp_model.predict(X_row)[0][0])
+    print(f"\n--- Predicted Probability: {prob:.3f} ---")
+    label = "UTI Detected" if prob > 0.5 else "No UTI Detected"
+    return f"{label} (probability: {prob:.3f})"
+
+# ------------------------------------------------------
+# 7) Download + Load TinyLlama Chatbot Model (UTI Bot)
+# ------------------------------------------------------
+
+# Download TinyLlama model into Drive
+!wget https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+    -O /content/drive/MyDrive/tinyllama.gguf
+
+from llama_cpp import Llama
+
+MODEL_PATH_TINY = "/content/drive/MyDrive/tinyllama.gguf"
+
+# Load TinyLlama from Drive
+llm = Llama(
+    model_path=MODEL_PATH_TINY,
+    n_ctx=2048,
+    n_threads=4
+)
+
+SYSTEM_PROMPT = """
+You are a friendly UTI medical assistant. You must ONLY talk about:
+
+• Urinary Tract Infection (UTI)
+• Symptoms, causes and common risk factors
+• Prevention habits and hygiene
+• Basic treatment guidance and self-care
+• When to see a doctor or seek urgent help
+• Tests commonly used to check for UTI
+• General lifestyle guidance for recovery
+
+STRICT RULES:
+• Do NOT mention pregnancy, sexual activity, condoms, childbirth, fertility, or relationships.
+• Do NOT discuss diseases other than UTI.
+• Do NOT prescribe medicines, antibiotics, brand names, or dosages.
+• Keep every answer safe, simple, and non-clinical.
+
+CONVERSATION RULES:
+• If the user asks about treatment or prevention, check whether AGE and GENDER are provided.
+• If missing, ask for age and gender using one short follow-up question.
+• Use the provided age and gender to give a personalized BUT general plan.
+• If the user asks something unrelated to UTI, politely redirect them back to urinary infection topics.
+
+STYLE:
+• Use short sentences, easy English, and step-by-step guidance.
+• NEVER pretend to be a doctor.
+• End every answer with a short disclaimer such as:
+  “Please consult a healthcare professional for medical diagnosis or treatment.”
+"""
+
+def ask_uti_bot(user_msg, gender, age):
+    profile = f"Patient profile: gender={gender}, age={age}."
+    full_prompt = f"<s>[INST]{SYSTEM_PROMPT}\n{profile}\nUser: {user_msg}[/INST]"
+
+    response = llm(
+        full_prompt,
+        max_tokens=200,
+        temperature=0.4,
+        top_p=0.9
+    )
+
+    answer = response["choices"][0]["text"].strip()
+
+    if "disclaimer" not in answer.lower():
+        answer += "\n\nDisclaimer: This is general educational information. Please consult a doctor for proper care."
+
+    return answer
+
+with gr.Blocks() as demo:
+    gr.Markdown("## 🧪 UTI Detection + 💬 UTI Chatbot")
+
+    # ---- Detection UI ----
+    gr.Markdown("### UTI Detection (enter urinalysis values)")
+
+    with gr.Row():
+        with gr.Column():
+            ua_leuk_in    = gr.Dropdown(manual_options["ua_leuk"],    label="ua_leuk")
+            ua_nitrite_in = gr.Dropdown(manual_options["ua_nitrite"], label="ua_nitrite")
+            ua_bacteria_in= gr.Dropdown(manual_options["ua_bacteria"],label="ua_bacteria")
+            ua_rbc_in     = gr.Dropdown(manual_options["ua_rbc"],     label="ua_rbc")
+            ua_blood_in   = gr.Dropdown(manual_options["ua_blood"],   label="ua_blood")
+            ua_ph_in      = gr.Number(value=float(modes.get("ua_ph",6)), label="ua_ph")
+            ua_sg_in      = gr.Dropdown(manual_options["ua_spec_grav"], label="ua_spec_grav")
+        with gr.Column():
+            ua_protein_in = gr.Dropdown(manual_options["ua_protein"], label="ua_protein")
+            ua_glucose_in = gr.Dropdown(manual_options["ua_glucose"], label="ua_glucose")
+            ua_ketones_in = gr.Dropdown(manual_options["ua_ketones"], label="ua_ketones")
+            ua_bili_in    = gr.Dropdown(manual_options["ua_bili"],    label="ua_bili")
+            ua_color_in   = gr.Dropdown(manual_options["ua_color"],   label="ua_color")
+            ua_clarity_in = gr.Dropdown(manual_options["ua_clarity"], label="ua_clarity")
+            ua_epi_in     = gr.Dropdown(manual_options["ua_epi"],     label="ua_epi")
+
+    predict_btn = gr.Button("Predict UTI")
+    result_box  = gr.Textbox(label="Prediction Result")
+
+    predict_btn.click(
+        fn=run_prediction_manual,
+        inputs=[
+            ua_leuk_in, ua_nitrite_in, ua_bacteria_in, ua_rbc_in, ua_blood_in,
+            ua_ph_in, ua_sg_in,
+            ua_protein_in, ua_glucose_in, ua_ketones_in, ua_bili_in,
+            ua_color_in, ua_clarity_in, ua_epi_in
+        ],
+        outputs=result_box
+    )
+
+    # ---- Chatbot UI ----
+    gr.Markdown("### 💬 UTI Prevention & Treatment Chatbot")
+
+    with gr.Row():
+        with gr.Column(scale=3):
+            chatbot = gr.Chatbot(label="UTI Chatbot")
+            user_msg = gr.Textbox(placeholder="Ask about UTI prevention or treatment...", label="Your question")
+            send_btn = gr.Button("Send")
+        with gr.Column(scale=1):
+            gender_in = gr.Dropdown(
+                ["Unknown","Female","Male","Other"],
+                value="Unknown",
+                label="Your gender (for personalised advice)"
+            )
+            age_in = gr.Number(
+                value=25,
+                label="Your age (years)"
+            )
+
+    chat_state = gr.State([])
+
+    def chat_step(msg, gender, age, history):
+        if history is None:
+            history = []
+        if not msg:
+            return history, ""
+        bot_reply = ask_uti_bot(msg, gender, age)
+        history.append((msg, bot_reply))
+        return history, ""
+
+    send_btn.click(
+        fn=chat_step,
+        inputs=[user_msg, gender_in, age_in, chat_state],
+        outputs=[chatbot, user_msg]
+    )
+
+demo.launch(share=True, debug=True, inline=False)
+```
